@@ -1,0 +1,3 @@
+32_Worker_Laborer_Worker_Laborer_32_68
+1
+380 302 364 414 0.8959

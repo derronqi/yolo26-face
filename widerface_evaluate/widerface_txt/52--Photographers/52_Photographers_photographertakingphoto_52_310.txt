@@ -1,0 +1,5 @@
+52_Photographers_photographertakingphoto_52_310
+3
+642 171 78 115 0.7664
+618 165 64 119 0.4267
+614 163 60 120 0.1571

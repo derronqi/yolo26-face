@@ -1,0 +1,5 @@
+52_Photographers_photographertakingphoto_52_125
+3
+830 146 37 73 0.6182
+831 150 34 68 0.0701
+830 149 33 70 0.0627

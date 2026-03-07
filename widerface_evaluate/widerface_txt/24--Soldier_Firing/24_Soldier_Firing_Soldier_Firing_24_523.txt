@@ -1,0 +1,3 @@
+24_Soldier_Firing_Soldier_Firing_24_523
+1
+325 181 175 94 0.8268

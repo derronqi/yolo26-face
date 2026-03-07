@@ -1,0 +1,4 @@
+26_Soldier_Drilling_Soldiers_Drilling_26_390
+2
+490 178 44 49 0.7383
+408 407 74 72 0.5730

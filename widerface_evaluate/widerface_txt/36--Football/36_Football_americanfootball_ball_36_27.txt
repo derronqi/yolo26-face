@@ -1,0 +1,4 @@
+36_Football_americanfootball_ball_36_27
+2
+651 45 72 88 0.8389
+184 207 60 81 0.8070

@@ -1,0 +1,3 @@
+32_Worker_Laborer_Worker_Laborer_32_44
+1
+501 254 268 362 0.9056

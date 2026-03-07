@@ -1,0 +1,4 @@
+2_Demonstration_Political_Rally_2_286
+2
+809 662 85 105 0.8807
+434 722 83 106 0.8645

@@ -1,0 +1,4 @@
+48_Parachutist_Paratrooper_Parachutist_Paratrooper_48_75
+2
+385 92 40 49 0.8531
+856 159 43 64 0.6558

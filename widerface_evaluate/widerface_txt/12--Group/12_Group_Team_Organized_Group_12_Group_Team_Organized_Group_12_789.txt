@@ -1,0 +1,5 @@
+12_Group_Team_Organized_Group_12_Group_Team_Organized_Group_12_789
+3
+300 161 52 67 0.8675
+521 598 52 70 0.8675
+680 458 44 56 0.8541

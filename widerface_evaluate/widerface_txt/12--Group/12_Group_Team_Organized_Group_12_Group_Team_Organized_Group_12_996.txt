@@ -1,0 +1,5 @@
+12_Group_Team_Organized_Group_12_Group_Team_Organized_Group_12_996
+3
+361 342 300 470 0.9259
+608 661 309 433 0.9035
+607 659 310 433 0.0254

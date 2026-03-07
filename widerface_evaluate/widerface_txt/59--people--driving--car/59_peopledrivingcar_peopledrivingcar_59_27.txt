@@ -1,0 +1,4 @@
+59_peopledrivingcar_peopledrivingcar_59_27
+2
+592 171 195 255 0.6818
+593 172 191 255 0.0130

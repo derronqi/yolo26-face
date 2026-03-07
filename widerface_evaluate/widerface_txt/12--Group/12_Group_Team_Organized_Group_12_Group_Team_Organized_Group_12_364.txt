@@ -1,0 +1,6 @@
+12_Group_Team_Organized_Group_12_Group_Team_Organized_Group_12_364
+4
+308 126 41 54 0.8746
+843 117 40 54 0.8661
+610 150 40 47 0.8655
+154 117 38 47 0.8538

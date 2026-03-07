@@ -1,0 +1,4 @@
+52_Photographers_photographertakingphoto_52_666
+2
+207 220 370 495 0.9118
+514 233 362 489 0.8651

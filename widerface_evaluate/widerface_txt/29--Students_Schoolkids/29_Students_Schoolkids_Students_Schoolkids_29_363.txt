@@ -1,0 +1,5 @@
+29_Students_Schoolkids_Students_Schoolkids_29_363
+3
+580 150 65 89 0.8487
+499 109 70 82 0.8295
+220 0 54 92 0.0155

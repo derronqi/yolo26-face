@@ -1,0 +1,4 @@
+8_Election_Campain_Election_Campaign_8_173
+2
+237 37 196 290 0.9160
+727 145 177 248 0.9024

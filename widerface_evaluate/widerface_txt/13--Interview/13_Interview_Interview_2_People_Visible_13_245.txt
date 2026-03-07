@@ -1,0 +1,4 @@
+13_Interview_Interview_2_People_Visible_13_245
+2
+473 74 145 225 0.8849
+229 134 168 172 0.8592

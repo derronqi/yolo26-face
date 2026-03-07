@@ -1,0 +1,4 @@
+9_Press_Conference_Press_Conference_9_648
+2
+460 170 284 385 0.9056
+0 471 138 257 0.8742

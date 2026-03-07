@@ -1,0 +1,4 @@
+52_Photographers_photographertakingphoto_52_96
+2
+180 332 20 27 0.6699
+182 333 20 25 0.2034

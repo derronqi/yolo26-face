@@ -1,0 +1,4 @@
+8_Election_Campain_Election_Campaign_8_266
+2
+629 221 107 165 0.8647
+285 90 131 220 0.8599

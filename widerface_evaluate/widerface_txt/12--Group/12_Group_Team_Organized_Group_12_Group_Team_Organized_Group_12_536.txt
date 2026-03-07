@@ -1,0 +1,6 @@
+12_Group_Team_Organized_Group_12_Group_Team_Organized_Group_12_536
+4
+498 137 40 57 0.8773
+853 66 31 61 0.8347
+629 179 60 58 0.8067
+632 184 56 53 0.3670

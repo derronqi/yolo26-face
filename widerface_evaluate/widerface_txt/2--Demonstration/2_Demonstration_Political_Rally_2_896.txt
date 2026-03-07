@@ -1,0 +1,4 @@
+2_Demonstration_Political_Rally_2_896
+2
+296 261 95 132 0.8349
+693 37 88 127 0.8263
