@@ -16,6 +16,14 @@ val 集，640 单尺度，标准协议（[widerface_evaluate](widerface_evaluate
 - 无 DFL（`reg_max=1`），推理无需分布展开，**对 CPU/NPU 等嵌入式部署友好**；
 - 训练只使用**标准 WIDER FACE train**，无需额外数据。
 
+## 模型权重
+
+| 模型 | 参数量 | 权重下载 |
+| --- | ----- | ------- |
+| yolo26n-face | 2.80M | [Google Drive](待填) |
+| yolo26s-face | 10.58M | [Google Drive](待填) |
+| yolo26m-face | 23.54M | [Google Drive](待填) |
+
 ## 特性
 
 - YOLO26 架构：无 DFL、E2E 双头（yolo26n 支持 NMS-free 推理）、MuSGD 优化器、ReLU 友好部署
