@@ -1,6 +1,9 @@
 
-path:  /home/derron/datasets # dataset root dir
-train: widerface/train # train images (relative to 'path') 210 images
+path:  /workspace/datasets # dataset root dir
+train: 
+  - widerface/train # train images (relative to 'path') 210 images
+    #- widerface/private
+    #- widerface/negatives
 val: widerface/val # val images (relative to 'path') 53 images
 
 # Keypoints

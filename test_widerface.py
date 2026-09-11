@@ -4,28 +4,36 @@ from ultralytics import YOLO
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='runs/pose/yolov8n-face/weights/best.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', type=str, default='runs/pose/yolo26s-face/weights/best.pt', help='model.pt path(s)')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.01, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--device', type=str, default='cuda:0', help='augmented inference')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--e2e', action='store_true', help='NMS-free: use the one2one head (default is the standard NMS protocol, comparable with published baselines)')
     parser.add_argument('--save_folder', default='./widerface_evaluate/widerface_txt/', type=str, help='Dir to save txt results')
     parser.add_argument('--dataset_folder', default='./data/widerface/val/images/', type=str, help='dataset path')
     opt = parser.parse_args()
     print(opt)
 
     model = YOLO(opt.weights)
+    if opt.e2e:
+        model.model.end2end = True  # route dual-head models through the one2one (NMS-free) path
 
     # testing dataset
     testset_folder = opt.dataset_folder
-    testset_list = opt.dataset_folder[:-7] + "wider_val.txt"
+    # locate wider_val.txt next to the image folder (supports both "<val>/images/" and flat "<val>/")
+    folder = testset_folder.rstrip('/')
+    base = os.path.dirname(folder) if os.path.basename(folder) == 'images' else folder
+    testset_list = os.path.join(base, "wider_val.txt")
     with open(testset_list, 'r') as fr:
         test_dataset = fr.read().split()
         num_images = len(test_dataset)
     for img_name in test_dataset:
-        image_path = testset_folder + img_name
-        results = model.predict(source=image_path, imgsz=opt.img_size, conf=opt.conf_thres, iou=opt.iou_thres, augment=opt.augment, device=opt.device, max_det=2048)
+        # val images are stored flat (event prefix kept in img_name for the prediction subfolder)
+        image_path = os.path.join(testset_folder, os.path.basename(img_name))
+        # 8.4.143: predict defaults to NMS-free for dual-head models; nms=True restores the standard NMS protocol
+        results = model.predict(source=image_path, imgsz=opt.img_size, conf=opt.conf_thres, iou=opt.iou_thres, augment=opt.augment, device=opt.device, max_det=2048, nms=not opt.e2e)
 
         save_name = opt.save_folder + img_name[:-4] + ".txt"
         dirname = os.path.dirname(save_name)

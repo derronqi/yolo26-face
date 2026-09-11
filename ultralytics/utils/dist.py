@@ -6,9 +6,11 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import USER_CONFIG_DIR
+from .patches import torch_save
 from .torch_utils import TORCH_1_9
 
 if TYPE_CHECKING:
@@ -23,12 +25,27 @@ def find_free_network_port() -> int:
 
     Returns:
         (int): The available network port number.
+
+    Notes:
+        Candidates are drawn below the default OS ephemeral floor (32768 on Linux, 49152 on macOS and Windows)
+        because the port is released here and rebound later by the DDP subprocess. An ephemeral port can be handed to
+        any outbound connection in that window, which surfaces as an EADDRINUSE rendezvous failure at launch.
     """
+    import random
     import socket
 
+    # SystemRandom as init_seeds() seeds the global RNG earlier in this process, which would hand every concurrent
+    # DDP launch on a host the same candidate list
+    for port in random.SystemRandom().sample(range(10000, 32768), 10):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue  # in use by an explicit listener, try the next candidate
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]  # port
+        s.bind(("127.0.0.1", 0))  # no non-ephemeral candidate available, fall back to an ephemeral port
+        return s.getsockname()[1]
 
 
 def generate_ddp_file(trainer: BaseTrainer) -> str:
@@ -46,28 +63,12 @@ def generate_ddp_file(trainer: BaseTrainer) -> str:
 
     Notes:
         The generated file is saved in the USER_CONFIG_DIR/DDP directory and includes:
-        - Trainer class import
+        - Trainer class and callback reconstruction
         - Configuration overrides from the trainer arguments
-        - Model path configuration
         - Training initialization code
     """
-    module, name = f"{trainer.__class__.__module__}.{trainer.__class__.__name__}".rsplit(".", 1)
+    import cloudpickle
 
-    content = f"""
-# Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
-from pathlib import Path, PosixPath  # For model arguments stored as Path instead of str
-overrides = {vars(trainer.args)}
-
-if __name__ == "__main__":
-    from {module} import {name}
-    from ultralytics.utils import DEFAULT_CFG_DICT
-
-    cfg = DEFAULT_CFG_DICT.copy()
-    cfg.update(save_dir='')   # handle the extra key 'save_dir'
-    trainer = {name}(cfg=cfg, overrides=overrides)
-    trainer.args.model = "{getattr(trainer.hub_session, "model_url", trainer.args.model)}"
-    results = trainer.train()
-"""
     (USER_CONFIG_DIR / "DDP").mkdir(exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix="_temp_",
@@ -77,7 +78,36 @@ if __name__ == "__main__":
         dir=USER_CONFIG_DIR / "DDP",
         delete=False,
     ) as file:
-        file.write(content)
+        path = Path(file.name).with_suffix(".pt")
+        torch_save(
+            {
+                "trainer": type(trainer),
+                "args": vars(trainer.args),
+                "model": trainer.model,
+                "callbacks": trainer.callbacks,
+            },
+            path,
+            pickle_module=cloudpickle,
+        )
+        file.write(
+            f"""
+# Ultralytics Multi-GPU training temp file (should be automatically deleted after use)
+if __name__ == "__main__":
+    import sys
+    sys.path = {sys.path!r}
+
+    from ultralytics.utils import DEFAULT_CFG_DICT
+    from ultralytics.utils.patches import torch_load
+
+    state = torch_load({str(path)!r}, map_location="cpu")
+
+    cfg = DEFAULT_CFG_DICT.copy()
+    cfg.update(save_dir='')   # handle the extra key 'save_dir'
+    trainer = state["trainer"](cfg=cfg, overrides=state["args"], _callbacks=state["callbacks"])
+    trainer.model = state["model"]
+    trainer.train()
+"""
+        )
     return file.name
 
 
@@ -91,8 +121,6 @@ def generate_ddp_command(trainer: BaseTrainer) -> tuple[list[str], str]:
         cmd (list[str]): The command to execute for distributed training.
         file (str): Path to the temporary file created for DDP training.
     """
-    import __main__  # noqa local import to avoid https://github.com/Lightning-AI/pytorch-lightning/issues/15218
-
     if not trainer.resume:
         shutil.rmtree(trainer.save_dir)  # remove the save_dir
     file = generate_ddp_file(trainer)
@@ -128,3 +156,4 @@ def ddp_cleanup(trainer: BaseTrainer, file: str) -> None:
     """
     if f"{id(trainer)}.py" in file:  # if temp_file suffix in file
         os.remove(file)
+        Path(file).with_suffix(".pt").unlink(missing_ok=True)  # the state written for the workers

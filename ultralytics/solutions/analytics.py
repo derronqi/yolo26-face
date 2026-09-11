@@ -113,13 +113,12 @@ class Analytics(BaseSolution):
         """
         self.extract_tracks(im0)  # Extract tracks
         if self.type == "line":
-            for _ in self.boxes:
-                self.total_counts += 1
+            self.total_counts += len(self.boxes)
             update_required = frame_number % self.update_every == 0 or self.last_plot_im is None
             if update_required:
                 self.last_plot_im = self.update_graph(frame_number=frame_number)
+                self.total_counts = 0
             plot_im = self.last_plot_im
-            self.total_counts = 0
         elif self.type in {"pie", "bar", "area"}:
             from collections import Counter
 
@@ -176,20 +175,20 @@ class Analytics(BaseSolution):
                 color_cycle = cycle(["#DD00BA", "#042AFF", "#FF4447", "#7D24FF", "#BD00FF"])
                 # Multiple lines or area update
                 x_data = self.ax.lines[0].get_xdata() if self.ax.lines else np.array([])
-                y_data_dict = {key: np.array([]) for key in count_dict.keys()}
+                y_data_dict = {key: np.array([]) for key in count_dict}
                 if self.ax.lines:
                     for line, key in zip(self.ax.lines, count_dict.keys()):
                         y_data_dict[key] = line.get_ydata()
 
                 x_data = np.append(x_data, float(frame_number))
                 max_length = len(x_data)
-                for key in count_dict.keys():
+                for key in count_dict:
                     y_data_dict[key] = np.append(y_data_dict[key], float(count_dict[key]))
                     if len(y_data_dict[key]) < max_length:
                         y_data_dict[key] = np.pad(y_data_dict[key], (0, max_length - len(y_data_dict[key])))
                 if len(x_data) > self.max_points:
                     x_data = x_data[1:]
-                    for key in count_dict.keys():
+                    for key in count_dict:
                         y_data_dict[key] = y_data_dict[key][1:]
 
                 self.ax.clear()
@@ -224,7 +223,6 @@ class Analytics(BaseSolution):
                 # Create the legend using labels from the bars
                 for bar, label in zip(bars, labels):
                     bar.set_label(label)  # Assign label to each bar
-                self.ax.legend(loc="upper left", fontsize=13, facecolor=self.fg_color, edgecolor=self.fg_color)
             elif plot == "pie":
                 total = sum(counts)
                 percentages = [size / total * 100 for size in counts]
@@ -249,7 +247,9 @@ class Analytics(BaseSolution):
         self.ax.set_ylabel(self.y_label, color=self.fg_color, fontsize=self.fontsize - 3)
 
         # Add and format legend
-        legend = self.ax.legend(loc="upper left", fontsize=13, facecolor=self.bg_color, edgecolor=self.bg_color)
+        legend = self.ax.get_legend() or self.ax.legend(
+            loc="upper left", fontsize=13, facecolor=self.bg_color, edgecolor=self.bg_color
+        )
         for text in legend.get_texts():
             text.set_color(self.fg_color)
 

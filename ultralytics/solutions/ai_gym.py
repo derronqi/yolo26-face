@@ -46,6 +46,12 @@ class AIGym(BaseSolution):
         self.down_angle = float(self.CFG["down_angle"])  # Pose down predefined angle to consider down pose
         self.kpts = self.CFG["kpts"]  # User selected kpts of workouts storage for further usage
 
+    def forget_tracks(self, track_ids):
+        """Drop retired IDs from workout state so it doesn't grow across a 24/7 stream (see BaseSolution)."""
+        super().forget_tracks(track_ids)
+        for track_id in track_ids:
+            self.states.pop(track_id, None)
+
     def process(self, im0) -> SolutionResults:
         """Monitor workouts using Ultralytics YOLO Pose Model.
 
@@ -56,9 +62,11 @@ class AIGym(BaseSolution):
             im0 (np.ndarray): Input image for processing.
 
         Returns:
-            (SolutionResults): Contains processed image `plot_im`, 'workout_count' (list of completed reps),
-                'workout_stage' (list of current stages), 'workout_angle' (list of angles), and 'total_tracks' (total
-                number of tracked individuals).
+            (SolutionResults): Contains processed image `plot_im`, 'workout_count' (list[int] of completed reps, one
+                entry per currently tracked individual), 'workout_stage' (list[str] of current stages), 'workout_angle'
+                (list[float] of current angles), and 'total_tracks' (int, total number of tracked individuals). All
+                per-track lists are aligned with the currently visible tracks so that ``len(results.workout_count)
+                == results.total_tracks``.
 
         Examples:
             >>> gym = AIGym()
@@ -71,7 +79,7 @@ class AIGym(BaseSolution):
         self.extract_tracks(im0)  # Extract tracks (bounding boxes, classes, and masks)
 
         if len(self.boxes):
-            kpt_data = self.tracks.keypoints.data
+            kpt_data = self.tracks.keypoints.data.cpu().numpy()  # one host transfer, avoids per-keypoint GPU sync
 
             for i, k in enumerate(kpt_data):
                 state = self.states[self.track_ids[i]]  # get state details
@@ -98,11 +106,14 @@ class AIGym(BaseSolution):
         plot_im = annotator.result()
         self.display_output(plot_im)  # Display output image, if environment support display
 
-        # Return SolutionResults
+        # Return SolutionResults aligned with currently tracked individuals only.
+        # self.states is keyed by track_id and may contain entries for people who have
+        # already left the frame; iterating self.track_ids keeps the per-track lists in
+        # sync with total_tracks so len(workout_count) == total_tracks at all times.
         return SolutionResults(
             plot_im=plot_im,
-            workout_count=[v["count"] for v in self.states.values()],
-            workout_stage=[v["stage"] for v in self.states.values()],
-            workout_angle=[v["angle"] for v in self.states.values()],
+            workout_count=[self.states[tid]["count"] for tid in self.track_ids],
+            workout_stage=[self.states[tid]["stage"] for tid in self.track_ids],
+            workout_angle=[self.states[tid]["angle"] for tid in self.track_ids],
             total_tracks=len(self.track_ids),
         )

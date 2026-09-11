@@ -1,0 +1,102 @@
+# YOLOv7-tiny for Face Detection with Keypoints
+
+# Parameters
+nc: 1  # number of classes (face only)
+end2end: False  # whether to use end-to-end mode
+reg_max: 16  # DFL bins
+activation: nn.ReLU()  # activation function for head
+kpt_shape: [5, 3]  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+
+# YOLOv7-tiny backbone
+backbone:
+  # [from, number, module, args]
+  - [-1, 1, Conv, [32, 3, 2]]  # 0-P1/2  
+  
+  - [-1, 1, Conv, [64, 3, 2]]  # 1-P2/4    
+   
+  - [-1, 1, Conv, [32, 1, 1]]
+  - [-2, 1, Conv, [32, 1, 1]]
+  - [-1, 1, Conv, [32, 3, 1]]
+  - [-1, 1, Conv, [32, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [64, 1, 1]]  # 7
+   
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]]  # 8-P3/8
+  - [-1, 1, Conv, [64, 1, 1]]
+  - [-2, 1, Conv, [64, 1, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [128, 1, 1]]  # 14
+   
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]]  # 15-P4/16
+  - [-1, 1, Conv, [128, 1, 1]]
+  - [-2, 1, Conv, [128, 1, 1]]
+  - [-1, 1, Conv, [128, 3, 1]]
+  - [-1, 1, Conv, [128, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [256, 1, 1]]  # 21
+   
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]]  # 22-P5/32
+  - [-1, 1, Conv, [256, 1, 1]]
+  - [-2, 1, Conv, [256, 1, 1]]
+  - [-1, 1, Conv, [256, 3, 1]]
+  - [-1, 1, Conv, [256, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [512, 1, 1]]  # 28
+
+# YOLOv7-tiny head
+head:
+  - [-1, 1, Conv, [256, 1, 1]]
+  - [-1, 1, SPPF, [256, 5]]  # SPPF replaces SP modules
+  - [-1, 1, Conv, [256, 1, 1]]  # 31
+  
+  - [-1, 1, Conv, [128, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [21, 1, Conv, [128, 1, 1]]  # route backbone P4
+  - [[-1, -2], 1, Concat, [1]]
+  
+  - [-1, 1, Conv, [64, 1, 1]]
+  - [-2, 1, Conv, [64, 1, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [128, 1, 1]]  # 41
+  
+  - [-1, 1, Conv, [64, 1, 1]]
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [14, 1, Conv, [64, 1, 1]]  # route backbone P3
+  - [[-1, -2], 1, Concat, [1]]
+  
+  - [-1, 1, Conv, [32, 1, 1]]
+  - [-2, 1, Conv, [32, 1, 1]]
+  - [-1, 1, Conv, [32, 3, 1]]
+  - [-1, 1, Conv, [32, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [64, 1, 1]]  # 51
+  
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [[-1, 41], 1, Concat, [1]]
+  
+  - [-1, 1, Conv, [64, 1, 1]]
+  - [-2, 1, Conv, [64, 1, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [-1, 1, Conv, [64, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [128, 1, 1]]  # 59
+  
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 31], 1, Concat, [1]]
+  
+  - [-1, 1, Conv, [128, 1, 1]]
+  - [-2, 1, Conv, [128, 1, 1]]
+  - [-1, 1, Conv, [128, 3, 1]]
+  - [-1, 1, Conv, [128, 3, 1]]
+  - [[-1, -2, -3, -4], 1, Concat, [1]]
+  - [-1, 1, Conv, [256, 1, 1]]  # 67
+     
+  - [51, 1, Conv, [128, 3, 1]]
+  - [59, 1, Conv, [256, 3, 1]]
+  - [67, 1, Conv, [512, 3, 1]]
+
+  - [[68,69,70], 1, Pose, [nc, kpt_shape]]  # Pose26(P3, P4, P5)

@@ -1,21 +1,20 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-Ultralytics Results, Boxes, Masks, Keypoints, Probs, and OBB classes for handling inference results.
+Ultralytics Results, Boxes, Masks, SemanticMask, Keypoints, Probs, and OBB classes for handling inference results.
 
-Usage: See https://docs.ultralytics.com/modes/predict/
+Usage: See https://docs.ultralytics.com/modes/predict
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
-from functools import lru_cache
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from ultralytics.data.augment import LetterBox
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, ops
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
 
@@ -69,7 +68,7 @@ class BaseTensor(SimpleClass):
             >>> data = torch.rand(100, 4)
             >>> base_tensor = BaseTensor(data, orig_shape=(720, 1280))
             >>> print(base_tensor.shape)
-            (100, 4)
+            torch.Size([100, 4])
         """
         return self.data.shape
 
@@ -173,12 +172,35 @@ class BaseTensor(SimpleClass):
         return self.__class__(self.data[idx], self.orig_shape)
 
 
+class _DenseResultTensor(BaseTensor):
+    """A BaseTensor representing zero or one dense per-image result, immune to row-wise indexing."""
+
+    def __len__(self) -> int:
+        """Return 1 if the map holds data, 0 if a prior indexing emptied it."""
+        return int(self.data.shape[0] > 0)
+
+    def __getitem__(self, idx):
+        """Return the intact map for any index selecting the one result, or an emptied map for an empty selection."""
+        idx = idx.cpu().numpy() if isinstance(idx, torch.Tensor) else idx  # NumPy reads a raw bool tensor as an int
+        empty = np.size(np.arange(len(self))[idx]) == 0  # bounds-checks idx of any type against the logical length
+        return self.__class__(self.data[:0] if empty else self.data, self.orig_shape)
+
+
+class SemanticMask(_DenseResultTensor):
+    """Semantic segmentation class map for one image."""
+
+
+class DepthMap(_DenseResultTensor):
+    """Per-pixel depth map (meters) for one image, shape (H, W)."""
+
+
 class Results(SimpleClass, DataExportMixin):
     """A class for storing and manipulating inference results.
 
     This class provides comprehensive functionality for handling inference results from various Ultralytics models,
-    including detection, segmentation, classification, and pose estimation. It supports visualization, data export, and
-    various coordinate transformations.
+    including detection, instance segmentation, semantic segmentation, depth estimation, classification, pose
+    estimation, and oriented bounding box detection. It supports visualization, data export, and various coordinate
+    transformations.
 
     Attributes:
         orig_img (np.ndarray): The original image as a numpy array.
@@ -188,6 +210,8 @@ class Results(SimpleClass, DataExportMixin):
         probs (Probs | None): Classification probabilities.
         keypoints (Keypoints | None): Detected keypoints.
         obb (OBB | None): Oriented bounding boxes.
+        semantic_mask (SemanticMask | None): Semantic segmentation class map.
+        depth (DepthMap | None): Per-pixel depth map.
         speed (dict): Dictionary containing inference speed information.
         names (dict): Dictionary mapping class indices to class names.
         path (str): Path to the input image file.
@@ -231,6 +255,8 @@ class Results(SimpleClass, DataExportMixin):
         keypoints: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         speed: dict[str, float] | None = None,
+        semantic_mask: torch.Tensor | None = None,
+        depth: torch.Tensor | None = None,
     ) -> None:
         """Initialize the Results class for storing and manipulating inference results.
 
@@ -243,6 +269,8 @@ class Results(SimpleClass, DataExportMixin):
             probs (torch.Tensor | None): A 1D tensor of probabilities of each class for classification task.
             keypoints (torch.Tensor | None): A 2D tensor of keypoint coordinates for each detection.
             obb (torch.Tensor | None): A 2D tensor of oriented bounding box coordinates for each detection.
+            semantic_mask (torch.Tensor | None): A 2D tensor of class IDs for semantic segmentation results.
+            depth (torch.Tensor | None): A 2D float tensor of per-pixel depth values (H, W).
             speed (dict | None): A dictionary containing preprocess, inference, and postprocess speeds (ms/image).
 
         Notes:
@@ -259,11 +287,13 @@ class Results(SimpleClass, DataExportMixin):
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
         self.obb = OBB(obb, self.orig_shape) if obb is not None else None
+        self.semantic_mask = SemanticMask(semantic_mask, self.orig_shape) if semantic_mask is not None else None
+        self.depth = DepthMap(depth, self.orig_shape) if depth is not None else None
         self.speed = speed if speed is not None else {"preprocess": None, "inference": None, "postprocess": None}
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "semantic_mask", "depth"
 
     def __getitem__(self, idx):
         """Return a Results object for a specific index of inference results.
@@ -282,11 +312,11 @@ class Results(SimpleClass, DataExportMixin):
         return self._apply("__getitem__", idx)
 
     def __len__(self) -> int:
-        """Return the number of detections in the Results object.
+        """Return the number of results in the Results object.
 
         Returns:
-            (int): The number of detections, determined by the length of the first non-empty attribute in (boxes, masks,
-                probs, keypoints, or obb).
+            (int): The number of results, determined by the length of the first non-empty attribute in (boxes, masks,
+                probs, keypoints, obb, semantic_mask, or depth). Empty Results objects return 0.
 
         Examples:
             >>> results = Results(orig_img, path, names, boxes=torch.rand(5, 6))
@@ -297,6 +327,7 @@ class Results(SimpleClass, DataExportMixin):
             v = getattr(self, k)
             if v is not None:
                 return len(v)
+        return 0
 
     def update(
         self,
@@ -305,6 +336,8 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
+        semantic_mask: torch.Tensor | None = None,
+        depth: torch.Tensor | None = None,
     ):
         """Update the Results object with new detection data.
 
@@ -317,7 +350,10 @@ class Results(SimpleClass, DataExportMixin):
             masks (torch.Tensor | None): A tensor of shape (N, H, W) containing segmentation masks.
             probs (torch.Tensor | None): A tensor of shape (num_classes,) containing class probabilities.
             obb (torch.Tensor | None): A tensor of shape (N, 7) or (N, 8) containing oriented bounding box coordinates.
-            keypoints (torch.Tensor | None): A tensor of shape (N, K, 3) containing keypoints, were K=17 for persons.
+            keypoints (torch.Tensor | None): A tensor of shape (N, K, 3) containing keypoints, where K=17 for persons.
+            semantic_mask (torch.Tensor | None): A tensor of shape (H, W) containing class IDs for semantic
+                segmentation.
+            depth (torch.Tensor | None): A tensor of shape (H, W) containing per-pixel depth values.
 
         Examples:
             >>> results = model("image.jpg")
@@ -329,11 +365,15 @@ class Results(SimpleClass, DataExportMixin):
         if masks is not None:
             self.masks = Masks(masks, self.orig_shape)
         if probs is not None:
-            self.probs = probs
+            self.probs = Probs(probs)
         if obb is not None:
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if semantic_mask is not None:
+            self.semantic_mask = SemanticMask(semantic_mask, self.orig_shape)
+        if depth is not None:
+            self.depth = DepthMap(depth, self.orig_shape)
 
     def _apply(self, fn: str, *args, **kwargs):
         """Apply a function to all non-empty attributes and return a new Results object with modified attributes.
@@ -357,8 +397,9 @@ class Results(SimpleClass, DataExportMixin):
         r = self.new()
         for k in self._keys:
             v = getattr(self, k)
-            if v is not None:
-                setattr(r, k, getattr(v, fn)(*args, **kwargs))
+            if v is None:
+                continue
+            setattr(r, k, getattr(v, fn)(*args, **kwargs))
         return r
 
     def cpu(self):
@@ -428,7 +469,7 @@ class Results(SimpleClass, DataExportMixin):
         return self._apply("to", *args, **kwargs)
 
     def new(self):
-        """Create a new Results object with the same image, path, names, and speed attributes.
+        """Create a new Results object with the same image, path, names, speed, and save directory attributes.
 
         Returns:
             (Results): A new Results object with copied attributes from the original instance.
@@ -437,7 +478,9 @@ class Results(SimpleClass, DataExportMixin):
             >>> results = model("path/to/image.jpg")
             >>> new_result = results[0].new()
         """
-        return Results(orig_img=self.orig_img, path=self.path, names=self.names, speed=self.speed)
+        result = Results(orig_img=self.orig_img, path=self.path, names=self.names, speed=self.speed)
+        result.save_dir = self.save_dir
+        return result
 
     def plot(
         self,
@@ -446,8 +489,7 @@ class Results(SimpleClass, DataExportMixin):
         font_size: float | None = None,
         font: str = "Arial.ttf",
         pil: bool = False,
-        img: np.ndarray | None = None,
-        im_gpu: torch.Tensor | None = None,
+        img: np.ndarray | torch.Tensor | None = None,
         kpt_radius: int = 5,
         kpt_line: bool = True,
         labels: bool = True,
@@ -468,8 +510,8 @@ class Results(SimpleClass, DataExportMixin):
             font_size (float | None): Font size for text. If None, scaled to image size.
             font (str): Font to use for text.
             pil (bool): Whether to return the image as a PIL Image.
-            img (np.ndarray | None): Image to plot on. If None, uses original image.
-            im_gpu (torch.Tensor | None): Normalized image on GPU for faster mask plotting.
+            img (np.ndarray | torch.Tensor | None): Image to plot on. Tensor images must be contiguous HWC BGR uint8. If
+                None, uses the original image.
             kpt_radius (int): Radius of drawn keypoints.
             kpt_line (bool): Whether to draw lines connecting keypoints.
             labels (bool): Whether to plot labels of bounding boxes.
@@ -488,7 +530,7 @@ class Results(SimpleClass, DataExportMixin):
         Examples:
             >>> results = model("image.jpg")
             >>> for result in results:
-            ...     im = result.plot()
+            ...     im = result.plot(pil=True)
             ...     im.show()
         """
         assert color_mode in {"instance", "class"}, f"Expected color_mode='instance' or 'class', not {color_mode}."
@@ -500,6 +542,8 @@ class Results(SimpleClass, DataExportMixin):
         pred_boxes, show_boxes = self.obb if is_obb else self.boxes, boxes
         pred_masks, show_masks = self.masks, masks
         pred_probs, show_probs = self.probs, probs
+        if pred_boxes is not None and (show_boxes or (pred_masks and show_masks)):
+            pred_boxes = pred_boxes.cpu()  # one host transfer avoids per-box GPU syncs in the color and label loops
         annotator = Annotator(
             deepcopy(self.orig_img if img is None else img),
             line_width,
@@ -511,30 +555,23 @@ class Results(SimpleClass, DataExportMixin):
 
         # Plot Segment results
         if pred_masks and show_masks:
-            if im_gpu is None:
-                img = LetterBox(pred_masks.shape[1:])(image=annotator.result())
-                im_gpu = (
-                    torch.as_tensor(img, dtype=torch.float16, device=pred_masks.data.device)
-                    .permute(2, 0, 1)
-                    .flip(0)
-                    .contiguous()
-                    / 255
-                )
+            pred_mask_data = torch.as_tensor(pred_masks.data)  # no-op for torch, converts a numpy() result
             idx = (
                 pred_boxes.id
-                if pred_boxes.is_track and color_mode == "instance"
+                if pred_boxes and pred_boxes.is_track and color_mode == "instance"
                 else pred_boxes.cls
                 if pred_boxes and color_mode == "class"
                 else reversed(range(len(pred_masks)))
             )
-            annotator.masks(pred_masks.data, colors=[colors(x, True) for x in idx], im_gpu=im_gpu)
+            annotator.masks(pred_mask_data, colors=[colors(x, True) for x in idx])
 
         # Plot Detect results
         if pred_boxes is not None and show_boxes:
             for i, d in enumerate(reversed(pred_boxes)):
-                c, d_conf, id = int(d.cls), float(d.conf) if conf else None, int(d.id.item()) if d.is_track else None
+                c = int(d.cls.item())  # .item() works for torch and numpy alike; int()/float() need 0-d since numpy 2.4
+                d_conf, id = float(d.conf.item()) if conf else None, int(d.id.item()) if d.is_track else None
                 name = ("" if id is None else f"id:{id} ") + names[c]
-                label = (f"{name} {d_conf:.2f}" if conf else name) if labels else None
+                label = (f"{name} {d_conf:.2f}" if conf else name) if labels else (f"{d_conf:.2f}" if conf else None)
                 box = d.xyxyxyxy.squeeze() if is_obb else d.xyxy.squeeze()
                 annotator.box_label(
                     box,
@@ -557,9 +594,22 @@ class Results(SimpleClass, DataExportMixin):
             x = round(self.orig_shape[0] * 0.03)
             annotator.text([x, x], text, txt_color=txt_color, box_color=(64, 64, 64, 128))  # RGBA box
 
+        # Plot Semantic Segmentation results
+        if self.semantic_mask and show_masks:
+            sem_mask = self.semantic_mask.data
+            if isinstance(sem_mask, torch.Tensor):
+                sem_mask = sem_mask.cpu().numpy()
+            annotator.semantic_mask(sem_mask, alpha=0.5)
+
+        # Plot Depth results — blend colorized depth heatmap over the image
+        if self.depth and show_masks:
+            d = self.depth.data
+            d = d.cpu().numpy() if hasattr(d, "cpu") else np.asarray(d)
+            annotator.depth_map(d)
+
         # Plot Pose results
         if self.keypoints is not None:
-            for i, k in enumerate(reversed(self.keypoints.data)):
+            for i, k in enumerate(reversed(self.keypoints.cpu().numpy().data)):  # one host transfer, no per-kpt syncs
                 annotator.kpts(
                     k,
                     self.orig_shape,
@@ -594,7 +644,7 @@ class Results(SimpleClass, DataExportMixin):
             >>> for result in results:
             ...     result.show()  # Display all results
         """
-        self.plot(show=True, *args, **kwargs)
+        self.plot(*args, show=True, **kwargs)
 
     def save(self, filename: str | None = None, *args, **kwargs) -> str:
         """Save annotated inference results image to file.
@@ -624,7 +674,7 @@ class Results(SimpleClass, DataExportMixin):
         if not filename:
             filename = f"results_{Path(self.path).name}"
         Path(filename).absolute().parent.mkdir(parents=True, exist_ok=True)
-        self.plot(save=True, filename=filename, *args, **kwargs)
+        self.plot(*args, save=True, filename=filename, **kwargs)
         return filename
 
     def verbose(self) -> str:
@@ -655,8 +705,14 @@ class Results(SimpleClass, DataExportMixin):
         if self.probs is not None:
             return f"{', '.join(f'{self.names[j]} {self.probs.data[j]:.2f}' for j in self.probs.top5)}, "
         if boxes:
-            counts = boxes.cls.int().bincount()
+            counts = torch.as_tensor(boxes.cls, dtype=torch.int64).bincount()  # no-op for torch, converts numpy()
             return "".join(f"{n} {self.names[i]}{'s' * (n > 1)}, " for i, n in enumerate(counts) if n > 0)
+        if self.depth is not None:
+            d = self.depth.data
+            d = d[d > 0]
+            return f"depth {float(d.min()):.2f}-{float(d.max()):.2f}m, " if len(d) else "depth (no valid pixels), "
+        if self.semantic_mask is not None:
+            return ""
 
     def save_txt(self, txt_file: str | Path, save_conf: bool = False) -> str:
         """Save detection results to a text file.
@@ -680,10 +736,16 @@ class Results(SimpleClass, DataExportMixin):
               - For detections: `class x_center y_center width height [confidence] [track_id]`
               - For classifications: `confidence class_name`
               - For masks and keypoints, the specific formats will vary accordingly.
+            - A detection whose mask contour has fewer than 3 points is omitted, since a shorter row is not a
+              polygon, and no file is written when no line remains.
             - The function will create the output directory if it does not exist.
             - If save_conf is False, the confidence scores will be excluded from the output.
             - Existing contents of the file will not be overwritten; new results will be appended.
+            - This method does not support Semantic Segmentation tasks.
         """
+        if self.semantic_mask is not None:
+            LOGGER.warning("Semantic Segmentation task does not support `save_txt`.")
+            return str(txt_file)
         is_obb = self.obb is not None
         boxes = self.obb if is_obb else self.boxes
         masks = self.masks
@@ -695,14 +757,21 @@ class Results(SimpleClass, DataExportMixin):
             [texts.append(f"{probs.data[j]:.2f} {self.names[j]}") for j in probs.top5]
         elif boxes:
             # Detect/segment/pose
+            boxes = boxes.cpu()  # one host transfer avoids per-box GPU syncs in the loop below
+            kpts = kpts.cpu() if kpts is not None else None
+            segments = masks.xyn if masks else None
             for j, d in enumerate(boxes):
-                c, conf, id = int(d.cls), float(d.conf), int(d.id.item()) if d.is_track else None
-                line = (c, *(d.xyxyxyxyn.view(-1) if is_obb else d.xywhn.view(-1)))
-                if masks:
-                    seg = masks[j].xyn[0].copy().reshape(-1)  # reversed mask.xyn, (n,2) to (n*2)
-                    line = (c, *seg)
+                c, conf, id = int(d.cls.item()), float(d.conf.item()), int(d.id.item()) if d.is_track else None
+                line = (c, *(d.xyxyxyxyn.reshape(-1) if is_obb else d.xywhn.reshape(-1)))
+                if segments is not None:
+                    seg = segments[j]
+                    if len(seg) < 3:  # fewer than 3 points is not a polygon, and writes a row no loader accepts
+                        continue
+                    line = (c, *seg.copy().reshape(-1))  # reversed mask.xyn, (n,2) to (n*2)
                 if kpts is not None:
-                    kpt = torch.cat((kpts[j].xyn, kpts[j].conf[..., None]), 2) if kpts[j].has_visible else kpts[j].xyn
+                    kpt = kpts[j].xyn
+                    if kpts[j].has_visible:
+                        kpt = torch.cat((torch.as_tensor(kpt), torch.as_tensor(kpts[j].conf)[..., None]), 2)
                     line += (*kpt.reshape(-1).tolist(),)
                 line += (conf,) * save_conf + (() if id is None else (id,))
                 texts.append(("%g " * len(line)).rstrip() % line)
@@ -730,7 +799,7 @@ class Results(SimpleClass, DataExportMixin):
             ...     result.save_crop(save_dir="path/to/crops", file_name="detection")
 
         Notes:
-            - This method does not support Classify or Oriented Bounding Box (OBB) tasks.
+            - This method does not support Classify, Oriented Bounding Box (OBB), or Semantic Segmentation tasks.
             - Crops are saved as 'save_dir/class_name/file_name.jpg'.
             - The method will create necessary subdirectories if they don't exist.
             - Original image is copied before cropping to avoid modifying the original.
@@ -741,11 +810,17 @@ class Results(SimpleClass, DataExportMixin):
         if self.obb is not None:
             LOGGER.warning("OBB task does not support `save_crop`.")
             return
-        for d in self.boxes:
+        if self.semantic_mask is not None:
+            LOGGER.warning("Semantic Segmentation task does not support `save_crop`.")
+            return
+        if self.depth is not None:
+            LOGGER.warning("Depth task does not support `save_crop`.")
+            return
+        for d in self.boxes.cpu():  # one host transfer avoids per-box GPU syncs in the loop below
             save_one_box(
                 d.xyxy,
                 self.orig_img.copy(),
-                file=Path(save_dir) / self.names[int(d.cls)] / Path(file_name).with_suffix(".jpg"),
+                file=Path(save_dir) / self.names[int(d.cls.item())] / Path(file_name).with_suffix(".jpg"),
                 BGR=True,
             )
 
@@ -787,11 +862,43 @@ class Results(SimpleClass, DataExportMixin):
                 )
             return results
 
+        if self.semantic_mask is not None:
+            # Return per-class pixel coverage for semantic segmentation
+            mask = self.semantic_mask.data
+            if isinstance(mask, torch.Tensor):
+                mask = mask.cpu().numpy()
+            unique, counts = np.unique(mask, return_counts=True)
+            total = mask.size
+            for class_id, count in zip(unique.tolist(), counts.tolist()):
+                if len(self.names) == 1:
+                    if class_id != 1:  # skip binary background and ignore label
+                        continue
+                    class_id = 0
+                elif class_id not in self.names:  # skip ignore label (e.g., 255)
+                    continue
+                results.append(
+                    {
+                        "name": self.names[class_id],
+                        "class": class_id,
+                        "pixel_ratio": round(count / total, decimals),
+                    }
+                )
+            return results
+
+        if self.depth is not None:
+            # Depth is a dense per-pixel map, not a per-instance result; excluded from summary.
+            return results
+
         is_obb = self.obb is not None
         data = self.obb if is_obb else self.boxes
+        if data:
+            data = data.cpu()  # one host transfer avoids per-row GPU syncs in the loop below
+        kpts = self.keypoints
+        if kpts is not None:
+            kpts = kpts.cpu()  # ditto for the per-row keypoints sync below
         h, w = self.orig_shape if normalize else (1, 1)
         for i, row in enumerate(data):  # xyxy, track_id if tracking, conf, class_id
-            class_id, conf = int(row.cls), round(row.conf.item(), decimals)
+            class_id, conf = int(row.cls.item()), round(row.conf.item(), decimals)
             box = (row.xyxyxyxy if is_obb else row.xyxy).squeeze().reshape(-1, 2).tolist()
             xy = {}
             for j, b in enumerate(box):
@@ -802,21 +909,19 @@ class Results(SimpleClass, DataExportMixin):
                 result["track_id"] = int(row.id.item())  # track ID
             if self.masks:
                 result["segments"] = {
-                    "x": (self.masks.xy[i][:, 0] / w).round(decimals).tolist(),
-                    "y": (self.masks.xy[i][:, 1] / h).round(decimals).tolist(),
+                    "x": (self.masks.xy[i][:, 0] / w).astype(float).round(decimals).tolist(),
+                    "y": (self.masks.xy[i][:, 1] / h).astype(float).round(decimals).tolist(),
                 }
-            if self.keypoints is not None:
-                kpt = self.keypoints[i]
-                if kpt.has_visible:
-                    x, y, visible = kpt.data[0].cpu().unbind(dim=1)
-                else:
-                    x, y = kpt.data[0].cpu().unbind(dim=1)
+            if kpts is not None:
+                kpt = kpts[i]
+                k = kpt.data[0]
+                k = k.cpu().numpy() if isinstance(k, torch.Tensor) else k
                 result["keypoints"] = {
-                    "x": (x / w).numpy().round(decimals).tolist(),
-                    "y": (y / h).numpy().round(decimals).tolist(),
+                    "x": (k[:, 0] / w).astype(float).round(decimals).tolist(),
+                    "y": (k[:, 1] / h).astype(float).round(decimals).tolist(),
                 }
                 if kpt.has_visible:
-                    result["keypoints"]["visible"] = visible.numpy().round(decimals).tolist()
+                    result["keypoints"]["visible"] = k[:, 2].astype(float).round(decimals).tolist()
             results.append(result)
 
         return results
@@ -950,8 +1055,7 @@ class Boxes(BaseTensor):
         """
         return self.data[:, -3] if self.is_track else None
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xywh(self) -> torch.Tensor | np.ndarray:
         """Convert bounding boxes from [x1, y1, x2, y2] format to [x, y, width, height] format.
 
@@ -965,14 +1069,10 @@ class Boxes(BaseTensor):
             ...     torch.tensor([[100, 50, 150, 100, 0.9, 0], [200, 150, 300, 250, 0.8, 1]]), orig_shape=(480, 640)
             ... )
             >>> xywh = boxes.xywh
-            >>> print(xywh)
-            tensor([[125.0000,  75.0000,  50.0000,  50.0000],
-                    [250.0000, 200.0000, 100.0000, 100.0000]])
         """
         return ops.xyxy2xywh(self.xyxy)
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xyxyn(self) -> torch.Tensor | np.ndarray:
         """Return normalized bounding box coordinates relative to the original image size.
 
@@ -994,8 +1094,7 @@ class Boxes(BaseTensor):
         xyxy[..., [1, 3]] /= self.orig_shape[0]
         return xyxy
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xywhn(self) -> torch.Tensor | np.ndarray:
         """Return normalized bounding boxes in [x, y, width, height] format.
 
@@ -1056,8 +1155,7 @@ class Masks(BaseTensor):
             masks = masks[None, :]
         super().__init__(masks, orig_shape)
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def xyn(self) -> list[np.ndarray]:
         """Return normalized xy-coordinates of the segmentation masks.
 
@@ -1080,8 +1178,7 @@ class Masks(BaseTensor):
             for x in ops.masks2segments(self.data)
         ]
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def xy(self) -> list[np.ndarray]:
         """Return the [x, y] pixel coordinates for each segment in the mask tensor.
 
@@ -1152,8 +1249,7 @@ class Keypoints(BaseTensor):
         super().__init__(keypoints, orig_shape)
         self.has_visible = self.data.shape[-1] == 3
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def xy(self) -> torch.Tensor | np.ndarray:
         """Return x, y coordinates of keypoints.
 
@@ -1174,8 +1270,7 @@ class Keypoints(BaseTensor):
         """
         return self.data[..., :2]
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def xyn(self) -> torch.Tensor | np.ndarray:
         """Return normalized coordinates (x, y) of keypoints relative to the original image size.
 
@@ -1195,8 +1290,7 @@ class Keypoints(BaseTensor):
         xy[..., 1] /= self.orig_shape[0]
         return xy
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def conf(self) -> torch.Tensor | np.ndarray | None:
         """Return confidence values for each keypoint.
 
@@ -1259,8 +1353,7 @@ class Probs(BaseTensor):
         """
         super().__init__(probs, orig_shape)
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def top1(self) -> int:
         """Return the index of the class with the highest probability.
 
@@ -1274,8 +1367,7 @@ class Probs(BaseTensor):
         """
         return int(self.data.argmax())
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def top5(self) -> list[int]:
         """Return the indices of the top 5 class probabilities.
 
@@ -1289,8 +1381,7 @@ class Probs(BaseTensor):
         """
         return (-self.data).argsort(0)[:5].tolist()  # this way works with both torch and numpy.
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def top1conf(self) -> torch.Tensor | np.ndarray:
         """Return the confidence score of the highest probability class.
 
@@ -1308,8 +1399,7 @@ class Probs(BaseTensor):
         """
         return self.data[self.top1]
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def top5conf(self) -> torch.Tensor | np.ndarray:
         """Return confidence scores for the top 5 classification predictions.
 
@@ -1399,6 +1489,11 @@ class OBB(BaseTensor):
             >>> xywhr = obb.xywhr
             >>> print(xywhr.shape)
             torch.Size([3, 5])
+
+        Notes:
+            Predictions are not canonicalized to the long-edge convention that training labels use, so width may be
+            smaller than height with the rotation measured from the short edge. Use `xyxyxyxy` when only the geometry
+            matters, or `ops.xyxyxyxy2xywhr(obb.xyxyxyxy)` for the canonical form.
         """
         return self.data[:, :5]
 
@@ -1447,7 +1542,7 @@ class OBB(BaseTensor):
                 bounding box. Returns None if tracking IDs are not available.
 
         Examples:
-            >>> results = model("image.jpg", tracker=True)  # Run inference with tracking
+            >>> results = model.track("path/to/video.mp4")  # Run inference with tracking
             >>> for result in results:
             ...     if result.obb is not None:
             ...         track_ids = result.obb.id
@@ -1456,15 +1551,14 @@ class OBB(BaseTensor):
         """
         return self.data[:, -3] if self.is_track else None
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xyxyxyxy(self) -> torch.Tensor | np.ndarray:
         """Convert OBB format to 8-point (xyxyxyxy) coordinate format for rotated bounding boxes.
 
         Returns:
             (torch.Tensor | np.ndarray): Rotated bounding boxes in xyxyxyxy format with shape (N, 4, 2), where N is the
-                number of boxes. Each box is represented by 4 points (x, y), starting from the top-left corner and
-                moving clockwise.
+                number of boxes. The 4 points (x, y) are wound counter-clockwise as rendered, starting from the corner
+                at +w/2, +h/2 in the box frame, so which image corner comes first follows the rotation.
 
         Examples:
             >>> obb = OBB(torch.tensor([[100, 100, 50, 30, 0.5, 0.9, 0]]), orig_shape=(640, 640))
@@ -1474,8 +1568,7 @@ class OBB(BaseTensor):
         """
         return ops.xywhr2xyxyxyxy(self.xywhr)
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xyxyxyxyn(self) -> torch.Tensor | np.ndarray:
         """Convert rotated bounding boxes to normalized xyxyxyxy format.
 
@@ -1495,8 +1588,7 @@ class OBB(BaseTensor):
         xyxyxyxyn[..., 1] /= self.orig_shape[0]
         return xyxyxyxyn
 
-    @property
-    @lru_cache(maxsize=2)
+    @cached_property
     def xyxy(self) -> torch.Tensor | np.ndarray:
         """Convert oriented bounding boxes (OBB) to axis-aligned bounding boxes in xyxy format.
 

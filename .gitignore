@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# 训练产物与权重（可由官方 assets 下载）
+runs/
+weights/
+*.pt
+abl/logs/
+*.log
+
+# 评测输出（可重新生成）
+widerface_evaluate/widerface_txt/
+widerface_evaluate/widerface_txt_backup/
+
+# 数据与临时文件
+data/
+*.tar.gz
+.DS_Store
+
+# 实验工具与记录（本地保留，不入库）
+abl/
+ultralytics/cfg/models/26/yolo26-face-dfl16.yaml

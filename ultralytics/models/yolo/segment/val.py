@@ -22,7 +22,6 @@ class SegmentationValidator(DetectionValidator):
     compute metrics such as mAP for both detection and segmentation tasks.
 
     Attributes:
-        plot_masks (list): List to store masks for plotting.
         process (callable): Function to process masks based on save_json and save_txt flags.
         args (SimpleNamespace): Arguments for the validator.
         metrics (SegmentMetrics): Metrics calculator for segmentation tasks.
@@ -35,14 +34,14 @@ class SegmentationValidator(DetectionValidator):
         >>> validator()
     """
 
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks: dict | None = None) -> None:
         """Initialize SegmentationValidator and set task to 'segment', metrics to SegmentMetrics.
 
         Args:
             dataloader (torch.utils.data.DataLoader, optional): DataLoader to use for validation.
             save_dir (Path, optional): Directory to save results.
             args (dict, optional): Arguments for the validator.
-            _callbacks (list, optional): List of callback functions.
+            _callbacks (dict, optional): Dictionary of callback functions.
         """
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.process = None
@@ -104,15 +103,7 @@ class SegmentationValidator(DetectionValidator):
         imgsz = [4 * x for x in proto.shape[2:]]  # get image size from proto
         for i, pred in enumerate(preds):
             coefficient = pred.pop("extra")
-            pred["masks"] = (
-                self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
-                if coefficient.shape[0]
-                else torch.zeros(
-                    (0, *(imgsz if self.process is ops.process_mask_native else proto.shape[2:])),
-                    dtype=torch.uint8,
-                    device=pred["bboxes"].device,
-                )
-            )
+            pred["masks"] = self.process(proto[i], coefficient, pred["bboxes"], shape=imgsz)
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
@@ -140,6 +131,11 @@ class SegmentationValidator(DetectionValidator):
                 masks = masks.gt_(0.5)
         prepared_batch["masks"] = masks
         return prepared_batch
+
+    def gather_stats(self) -> None:
+        """Gather stats from all GPUs."""
+        super().gather_stats()  # gather stats from DetectionValidator
+        self._gather_image_metrics(self.metrics.seg)
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
         """Compute correct prediction matrix for a batch based on bounding boxes and optional masks.
@@ -255,23 +251,30 @@ class SegmentationValidator(DetectionValidator):
             Returns:
                 (list[list[int]]): A list of RLE counts for each mask.
             """
+            num_masks, width = pixels.shape
             transitions = pixels[:, 1:] != pixels[:, :-1]
             row_idx, col_idx = torch.where(transitions)
-            col_idx = col_idx + 1
+            n = len(row_idx)
+            # Pack each (mask, position) pair into one integer for a compact, single device-to-host transfer.
+            row_idx.mul_(width).add_(col_idx).add_(1)
+            del col_idx
+            packed = torch.cat((row_idx, pixels[:, 0].to(row_idx.dtype))).cpu().numpy()
+            positions, starts = np.split(packed, (n,))
+            boundaries = np.searchsorted(positions, np.arange(num_masks + 1) * width)
 
             # Compute run lengths
             counts = []
-            for i in range(pixels.shape[0]):
-                positions = col_idx[row_idx == i]
-                if len(positions):
-                    count = torch.diff(positions).tolist()
-                    count.insert(0, positions[0].item())
-                    count.append(len(pixels[i]) - positions[-1].item())
+            for i in range(num_masks):
+                mask_positions = positions[boundaries[i] : boundaries[i + 1]] - i * width
+                if mask_positions.size:
+                    count = np.diff(mask_positions).tolist()
+                    count.insert(0, mask_positions[0])
+                    count.append(width - mask_positions[-1])
                 else:
-                    count = [len(pixels[i])]
+                    count = [width]
 
                 # Ensure starting with background (0) count
-                if pixels[i][0].item() == 1:
+                if starts[i] == 1:
                     count = [0, *count]
                 counts.append(count)
 

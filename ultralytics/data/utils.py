@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import random
 import subprocess
 import time
 import zipfile
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from tarfile import is_tarfile
 from typing import Any
@@ -22,18 +20,16 @@ from ultralytics.utils import (
     ASSETS_URL,
     DATASETS_DIR,
     LOGGER,
-    NUM_THREADS,
     ROOT,
     SETTINGS_FILE,
-    TQDM,
     YAML,
     clean_url,
     colorstr,
     emojis,
     is_dir_writeable,
 )
-from ultralytics.utils.checks import check_file, check_font, is_ascii
-from ultralytics.utils.downloads import download, safe_download, unzip_file
+from ultralytics.utils.checks import check_file, check_font, is_ascii, normalize_platform_uri
+from ultralytics.utils.downloads import download, safe_download
 from ultralytics.utils.ops import segments2boxes
 
 HELP_URL = "See https://docs.ultralytics.com/datasets for dataset formatting guidance."
@@ -45,7 +41,6 @@ IMG_FORMATS = {
     "heif",
     "jp2",
     "jpeg",
-    "jpeg2000",
     "jpg",
     "mpo",
     "png",
@@ -55,12 +50,60 @@ IMG_FORMATS = {
 }
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # videos
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
+DATASET_KEY_TYPES = {  # dataset YAML keys and their permitted types
+    "path": (str,),
+    "train": (str, list),
+    "val": (str, list),
+    "test": (str, list),
+    "names": (list, dict),
+    "kpt_shape": (list,),
+    "flip_idx": (list,),
+}
+
+DEPTH_PNG_SCALE = 1000  # uint16 millimeters by default; zero is invalid
 
 
-def img2label_paths(img_paths: list[str]) -> list[str]:
+def save_depth_png(path: str | Path, depth: np.ndarray, scale: float = DEPTH_PNG_SCALE) -> None:
+    """Save metric depth as a scaled uint16 PNG with zero reserved for invalid pixels."""
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Depth scale must be a positive finite number")
+    depth = np.asarray(depth, dtype=np.float32).squeeze()
+    if depth.ndim != 2:
+        raise ValueError(f"Depth map must be 2D, got shape {depth.shape}")
+    valid = np.isfinite(depth) & (depth > 0)
+    encoded = np.zeros(depth.shape, dtype=np.uint16)
+    if valid.any():
+        scaled = np.rint(depth[valid] * scale)
+        if scaled.max() > np.iinfo(np.uint16).max:
+            raise ValueError(f"Depth map exceeds the {np.iinfo(np.uint16).max / scale:g} meter PNG limit")
+        encoded[valid] = np.maximum(scaled, 1).astype(np.uint16)
+    if not cv2.imwrite(str(path), encoded):
+        raise OSError(f"Failed to save depth map to {path}")
+
+
+def load_depth(path: str | Path, scale: float = DEPTH_PNG_SCALE) -> np.ndarray:
+    """Load metric depth from a scaled uint16 PNG or floating-point meter NPY."""
+    path = Path(path)
+    if path.suffix.lower() == ".npy":
+        depth = np.load(path, allow_pickle=False)
+        if depth.ndim != 2 or depth.dtype.kind != "f":
+            raise ValueError(f"Depth map {path} must be a 2D floating-point NPY array")
+        return np.nan_to_num(depth.astype(np.float32, copy=False), copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Depth scale must be a positive finite number")
+    with Image.open(path) as image:
+        if image.format != "PNG" or image.mode not in {"I", "I;16"}:
+            raise ValueError(f"Depth PNG {path} must be a 2D uint16 map")
+        encoded = np.asarray(image)
+    depth = encoded.astype(np.float32)
+    depth /= scale
+    return depth
+
+
+def img2label_paths(img_paths: list[str], label_dir: str = "labels", suffix: str = ".txt") -> list[str]:
     """Convert image paths to label paths by replacing 'images' with 'labels' and extension with '.txt'."""
-    sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
-    return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
+    sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}{label_dir}{os.sep}"  # /images/, /labels/ substrings
+    return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + f"{suffix}" for x in img_paths]
 
 
 def check_file_speeds(
@@ -128,15 +171,16 @@ def check_file_speeds(
         std_speed = np.std(read_speeds, ddof=1) if len(read_speeds) > 1 else 0
         speed_msg = f", read: {avg_speed:.1f}±{std_speed:.1f} MB/s"
     else:
+        avg_speed = float("inf")
         speed_msg = ""
 
-    if avg_ping < threshold_ms or avg_speed < threshold_mb:
+    if avg_ping < threshold_ms and avg_speed > threshold_mb:
         LOGGER.info(f"{prefix}Fast image access ✅ ({ping_msg}{speed_msg}{size_msg})")
     else:
         LOGGER.warning(
             f"{prefix}Slow image access detected ({ping_msg}{speed_msg}{size_msg}). "
             f"Use local storage instead of remote/mounted storage for better performance. "
-            f"See https://docs.ultralytics.com/guides/model-training-tips/"
+            f"See https://docs.ultralytics.com/guides/model-training-tips"
         )
 
 
@@ -167,29 +211,119 @@ def exif_size(img: Image.Image) -> tuple[int, int]:
     return s
 
 
+def check_image(im_file: str) -> tuple[str, tuple[int, int]]:
+    """Verify an image file for integrity and correct corrupt JPEGs if found.
+
+    Args:
+        im_file (str): Path to the image file to check.
+
+    Returns:
+        (str): A message describing any corrective action taken, or an empty string if the image is valid.
+        (tuple[int, int]): Image shape as (height, width) in pixels.
+
+    Raises:
+        AssertionError: If the image size is less than 10 pixels in any dimension or the format is invalid.
+    """
+    msg = ""
+    im = Image.open(im_file)
+    im.verify()  # PIL verify
+    shape = exif_size(im)  # image size
+    shape = (shape[1], shape[0])  # hw
+    assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+    assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
+    if im.format.lower() in {"jpg", "jpeg"}:
+        with open(im_file, "rb") as f:
+            f.seek(-2, 2)
+            if f.read() != b"\xff\xd9":  # corrupt JPEG
+                ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                msg = f"{im_file}: corrupt JPEG restored and saved"
+    return msg, shape
+
+
 def verify_image(args: tuple) -> tuple:
     """Verify one image."""
     (im_file, cls), prefix = args
     # Number (found, corrupt), message
     nf, nc, msg = 0, 0, ""
     try:
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+        msg = check_image(im_file)[0]
+        msg = f"{prefix}{msg}" if msg else ""
         nf = 1
     except Exception as e:
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
     return (im_file, cls), nf, nc, msg
+
+
+def verify_image_depth(args: tuple) -> tuple:
+    """Verify that an image and its paired depth map exist and are readable."""
+    im_file, depth_file, prefix, scale = args
+    # Number (found, missing, corrupt), message
+    nf, nm, nc, msg = 0, 0, 0, ""
+    try:
+        msg, shape = check_image(im_file)
+        msg = f"{prefix}{msg}" if msg else ""
+        if not os.path.isfile(depth_file):
+            nm = 1
+            msg = f"{prefix}{im_file}: ignoring image with missing depth map {depth_file}"
+            return None, None, nf, nm, nc, msg
+        if Path(depth_file).suffix.lower() == ".npy":
+            depth = np.load(depth_file, mmap_mode="r", allow_pickle=False)
+            assert depth.ndim == 2 and depth.dtype.kind == "f", "depth NPY must be 2D and floating-point"
+            depth_shape = depth.shape
+        else:
+            assert (
+                isinstance(scale, (int, float)) and not isinstance(scale, bool) and np.isfinite(scale) and scale > 0
+            ), "depth_scale must be a positive finite number"
+            with Image.open(depth_file) as depth:
+                assert depth.format == "PNG" and depth.mode in {"I", "I;16"}, (
+                    f"depth map {depth_file} must be an integer grayscale PNG"
+                )
+                depth_shape = (depth.height, depth.width)
+                depth.verify()
+        assert abs(np.log((depth_shape[1] / depth_shape[0]) / (shape[1] / shape[0]))) <= 0.02, (
+            f"depth map shape {depth_shape} does not match image shape {shape}"
+        )
+        nf = 1
+        return im_file, shape, nf, nm, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}{im_file}: ignoring corrupt image/depth: {e}"
+    return None, None, nf, nm, nc, msg
+
+
+def verify_image_mask(args: tuple) -> tuple:
+    """Verify that an image and its semantic mask exist, are readable, and have matching shapes."""
+    im_file, mask_file, prefix, check_bit_depth = args
+    # Number (found, missing, corrupt), message
+    nf, nm, nc, msg = 0, 0, 0, ""
+    try:
+        msg, shape = check_image(im_file)
+        msg = f"{prefix}{msg}" if msg else ""
+        if not os.path.isfile(mask_file):
+            for ext in IMG_FORMATS:  # check other suffixes
+                alt_mask_file = mask_file.rsplit(".", 1)[0] + f".{ext}"
+                if os.path.isfile(alt_mask_file):
+                    mask_file = alt_mask_file
+                    break
+        if os.path.isfile(mask_file):
+            mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+            assert mask is not None, f"mask file {mask_file} is unreadable"
+            assert mask.shape[:2] == shape, f"mask size {mask.shape[:2]} does not match image size {shape}"
+            is_1bit = False
+            if check_bit_depth:
+                with Image.open(mask_file) as im:
+                    is_1bit = im.mode == "1"
+            nf = 1
+        else:
+            nm = 1
+            msg = f"{prefix}{im_file}: ignoring image with missing mask {mask_file}"
+            return None, None, None, None, nm, nf, nc, msg
+        return im_file, mask_file, shape, is_1bit, nm, nf, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}{im_file}: ignoring corrupt image/mask: {e}"
+    return None, None, None, None, nm, nf, nc, msg
 
 
 def verify_image_label(args: tuple) -> list:
@@ -199,18 +333,8 @@ def verify_image_label(args: tuple) -> list:
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
         # Verify images
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+        msg, shape = check_image(im_file)
+        msg = f"{prefix}{msg}" if msg else ""
 
         # Verify labels
         if os.path.isfile(lb_file):
@@ -218,6 +342,7 @@ def verify_image_label(args: tuple) -> list:
             with open(lb_file, encoding="utf-8") as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
                 if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
+                    assert not any(len(x) == 5 for x in lb), "labels mix segment and detection rows"
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
@@ -371,10 +496,9 @@ def polygons2masks_overlap(
     areas = np.asarray(areas)
     index = np.argsort(-areas)
     ms = np.array(ms)[index]
+    # Running max: the old `masks + mask` sum hit 2 * i + 1 and overflowed uint8 past 128 overlapping instances
     for i in range(len(segments)):
-        mask = ms[i] * (i + 1)
-        masks = masks + mask
-        masks = np.clip(masks, a_min=0, a_max=i + 1)
+        np.maximum(masks, ms[i] * (i + 1), out=masks)
     return masks, index
 
 
@@ -398,7 +522,33 @@ def find_dataset_yaml(path: Path) -> Path:
     return files[0]
 
 
-def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]:
+def get_split_fraction(fraction: float | list[float | int], split: str) -> float | int:
+    """Return a split ratio/count, normalizing boundary values to 0.0 (none) or 1.0 (all)."""
+    if isinstance(fraction, list) and split in (splits := ("train", "val", "test")):
+        index = splits.index(split)
+        fraction = fraction[index] if index < len(fraction) else 1.0
+    elif split != "train":
+        fraction = 1.0
+    fraction = float(fraction) if fraction in {0, 1} else fraction
+    if split in {"train", "val"} and fraction == 0:
+        raise ValueError(f"{split} fraction must select at least one image")
+    return fraction
+
+
+def convert_ndjson_to_yolo_if_needed(data: str | Path, fraction=1.0) -> str | Path:
+    """Convert an NDJSON dataset or Platform dataset URI to YOLO format."""
+    data = normalize_platform_uri(data)  # accept Platform web URLs (https://platform.ultralytics.com/.../datasets/...)
+    data_str = str(data)
+    if clean_url(data_str).endswith(".ndjson") or (data_str.startswith("ul://") and "/datasets/" in data_str):
+        import asyncio
+
+        from ultralytics.data.converter import convert_ndjson_to_yolo
+
+        return asyncio.run(convert_ndjson_to_yolo(data, fraction=fraction))
+    return data
+
+
+def check_det_dataset(dataset: str, autodownload: bool = True, split: str = "") -> dict[str, Any]:
     """Download, verify, and/or unzip a dataset if not found locally.
 
     This function checks the availability of a specified dataset, and if not found, it has the option to download and
@@ -408,11 +558,18 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     Args:
         dataset (str): Path to the dataset or dataset descriptor (like a YAML file).
         autodownload (bool, optional): Whether to automatically download the dataset if not found.
+        split (str, optional): Dataset split required by the caller.
 
     Returns:
         (dict[str, Any]): Parsed dataset information and paths.
     """
-    file = check_file(dataset)
+    dataset = str(dataset)
+    if "://" not in dataset and not Path(dataset).exists() and Path(dataset).suffix not in {".yaml", ".yml"}:
+        # allow bare dataset names, e.g. 'coco8' -> 'coco8.yaml', 'DOTAv1.5' -> 'DOTAv1.5.yaml'
+        dataset = next((f"{dataset}{x}" for x in (".yaml", ".yml") if check_file(f"{dataset}{x}", hard=False)), dataset)
+    file = Path(check_file(dataset))
+    if file.is_dir():
+        file = find_dataset_yaml(file)
 
     # Download (optional)
     extract_dir = ""
@@ -425,6 +582,11 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     data = YAML.load(file, append_filename=True)  # dictionary
 
     # Checks
+    for key, valid_types in DATASET_KEY_TYPES.items():
+        if data.get(key) is not None and not isinstance(data[key], valid_types):
+            expected = " or ".join(t.__name__ for t in valid_types)
+            raise TypeError(f"{dataset} '{key}' must be {expected}, not {type(data[key]).__name__}")
+
     for k in "train", "val":
         if k not in data:
             if k != "val" or "validation" not in data:
@@ -433,11 +595,23 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
                 )
             LOGGER.warning("renaming data YAML 'validation' key to 'val' to match YOLO format.")
             data["val"] = data.pop("validation")  # replace 'validation' key with 'val' key
-    if "names" not in data and "nc" not in data:
+    if split and not data.get(split):
+        raise FileNotFoundError(f"{dataset} '{split}:' images not found ❌")
+    # `names` compared to None, not membership: a bare `names:` parses to None and len(None) below
+    # raises. `nc` stays membership so a valueless `nc:` still reaches its "must be an integer" error.
+    if data.get("names") is None and "nc" not in data:
         raise SyntaxError(emojis(f"{dataset} key missing ❌.\n either 'names' or 'nc' are required in all data YAMLs."))
-    if "names" in data and "nc" in data and len(data["names"]) != data["nc"]:
+    if "nc" in data and not isinstance(data["nc"], int):
+        try:
+            nc = float(data["nc"])  # accept integer-like values, e.g. '10' or 10.0, but not 1.9 or placeholders
+            if nc != int(nc):
+                raise ValueError
+            data["nc"] = int(nc)
+        except (TypeError, ValueError):
+            raise SyntaxError(emojis(f"{dataset} 'nc: {data['nc']}' must be an integer ❌."))
+    if data.get("names") is not None and data.get("nc") is not None and len(data["names"]) != data["nc"]:
         raise SyntaxError(emojis(f"{dataset} 'names' length {len(data['names'])} and 'nc: {data['nc']}' must match."))
-    if "names" not in data:
+    if data.get("names") is None:
         data["names"] = [f"class_{i}" for i in range(data["nc"])]
     else:
         data["nc"] = len(data["names"])
@@ -463,7 +637,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
                 data[k] = [str((path / x).resolve()) for x in data[k]]
 
     # Parse YAML
-    val, s = (data.get(x) for x in ("val", "download"))
+    val, s = (data.get(x) for x in (split or "val", "download"))
     if val:
         val = [Path(x).resolve() for x in (val if isinstance(val, list) else [val])]  # val path
         if not all(x.exists() for x in val):
@@ -483,10 +657,12 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
                 LOGGER.info(f"Running {s} ...")
                 subprocess.run(s.split(), check=True)
             else:  # python script
-                exec(s, {"yaml": data})
+                exec(s, {"yaml": data})  # noqa: S102
             dt = f"({round(time.time() - t, 1)}s)"
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in {0, None} else f"failure {dt} ❌"
             LOGGER.info(f"Dataset download {s}\n")
+    if data.get("masks_dir") is None and (path / "masks").is_dir():  # after download so scripts can create it
+        data["masks_dir"] = "masks"  # PNG semantic masks in the default folder select SemanticDataset
     check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf")  # download fonts
 
     return data  # dictionary
@@ -511,6 +687,9 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
             - 'nc' (int): The number of classes in the dataset.
             - 'names' (dict[int, str]): A dictionary of class names in the dataset.
     """
+    if split and split not in {"train", "val", "test"}:
+        raise ValueError(f"Invalid classification dataset split '{split}'. Use 'train', 'val', or 'test'.")
+
     # Download (optional if dataset=https://file.zip is passed directly)
     if str(dataset).startswith(("http:/", "https:/")):
         dataset = safe_download(dataset, dir=DATASETS_DIR, unzip=True, delete=False)
@@ -524,7 +703,7 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
         if data_dir.suffix != "":
             raise ValueError(
                 f'Classification datasets must be a directory (data="path/to/dir") not a file (data="{dataset}"), '
-                "See https://docs.ultralytics.com/datasets/classify/"
+                "See https://docs.ultralytics.com/datasets/classify"
             )
         LOGGER.info("")
         LOGGER.warning(f"Dataset not found, missing path {data_dir}, attempting download...")
@@ -537,14 +716,14 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
     train_set = data_dir / "train"
     if not train_set.is_dir():
         LOGGER.warning(f"Dataset 'split=train' not found at {train_set}")
-        if image_files := list(data_dir.rglob("*.jpg")) + list(data_dir.rglob("*.png")):
+        if image_files := [f for f in data_dir.rglob("*.*") if f.suffix[1:].lower() in IMG_FORMATS]:
             from ultralytics.data.split import split_classify_dataset
 
             LOGGER.info(f"Found {len(image_files)} images in subdirectories. Attempting to split...")
             data_dir = split_classify_dataset(data_dir, train_ratio=0.8)
             train_set = data_dir / "train"
         else:
-            LOGGER.error(f"No images found in {data_dir} or its subdirectories.")
+            raise FileNotFoundError(f"No images found in {data_dir} or its subdirectories.")
     val_set = (
         data_dir / "val"
         if (data_dir / "val").exists()
@@ -562,9 +741,11 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
         LOGGER.warning("Dataset 'split=test' not found, using 'split=val' instead.")
         test_set = val_set
 
-    nc = len([x for x in (data_dir / "train").glob("*") if x.is_dir()])  # number of classes
-    names = [x.name for x in (data_dir / "train").iterdir() if x.is_dir()]  # class names list
-    names = dict(enumerate(sorted(names)))
+    if (ndjson_names := data_dir / ".ndjson.yaml").is_file():
+        names = YAML.load(ndjson_names)["names"]
+    else:
+        names = dict(enumerate(sorted(x.name for x in (data_dir / "train").iterdir() if x.is_dir())))
+    nc = len(names)
 
     # Print to console
     for k, v in {"train": train_set, "val": val_set, "test": test_set}.items():
@@ -580,178 +761,13 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
                     raise FileNotFoundError(f"{dataset} '{k}:' no training images found")
                 else:
                     LOGGER.warning(f"{prefix} found {nf} images in {nd} classes (no images found)")
-            elif nd != nc:
+            elif nd != nc and not ndjson_names.is_file():
                 LOGGER.error(f"{prefix} found {nf} images in {nd} classes (requires {nc} classes, not {nd})")
             else:
-                LOGGER.info(f"{prefix} found {nf} images in {nd} classes ✅ ")
+                class_count = f"{nd}/{nc}" if ndjson_names.is_file() else nd
+                LOGGER.info(f"{prefix} found {nf} images in {class_count} classes ✅ ")
 
     return {"train": train_set, "val": val_set, "test": test_set, "nc": nc, "names": names, "channels": 3}
-
-
-class HUBDatasetStats:
-    """A class for generating HUB dataset JSON and `-hub` dataset directory.
-
-    Args:
-        path (str): Path to data.yaml or data.zip (with data.yaml inside data.zip).
-        task (str): Dataset task. Options are 'detect', 'segment', 'pose', 'classify', 'obb'.
-        autodownload (bool): Attempt to download dataset if not found locally.
-
-    Attributes:
-        task (str): Dataset task type.
-        hub_dir (Path): Directory path for HUB dataset files.
-        im_dir (Path): Directory path for compressed images.
-        stats (dict): Statistics dictionary containing dataset information.
-        data (dict): Dataset configuration data.
-
-    Methods:
-        get_json: Return dataset JSON for Ultralytics HUB.
-        process_images: Compress images for Ultralytics HUB.
-
-    Examples:
-        >>> from ultralytics.data.utils import HUBDatasetStats
-        >>> stats = HUBDatasetStats("path/to/coco8.zip", task="detect")  # detect dataset
-        >>> stats = HUBDatasetStats("path/to/coco8-seg.zip", task="segment")  # segment dataset
-        >>> stats = HUBDatasetStats("path/to/coco8-pose.zip", task="pose")  # pose dataset
-        >>> stats = HUBDatasetStats("path/to/dota8.zip", task="obb")  # OBB dataset
-        >>> stats = HUBDatasetStats("path/to/imagenet10.zip", task="classify")  # classification dataset
-        >>> stats.get_json(save=True)
-        >>> stats.process_images()
-
-    Notes:
-        Download *.zip files from https://github.com/ultralytics/hub/tree/main/example_datasets
-        i.e. https://github.com/ultralytics/hub/raw/main/example_datasets/coco8.zip for coco8.zip.
-    """
-
-    def __init__(self, path: str = "coco8.yaml", task: str = "detect", autodownload: bool = False):
-        """Initialize class."""
-        path = Path(path).resolve()
-        LOGGER.info(f"Starting HUB dataset checks for {path}....")
-
-        self.task = task  # detect, segment, pose, classify, obb
-        if self.task == "classify":
-            unzip_dir = unzip_file(path)
-            data = check_cls_dataset(unzip_dir)
-            data["path"] = unzip_dir
-        else:  # detect, segment, pose, obb
-            _, data_dir, yaml_path = self._unzip(Path(path))
-            try:
-                # Load YAML with checks
-                data = YAML.load(yaml_path)
-                data["path"] = ""  # strip path since YAML should be in dataset root for all HUB datasets
-                YAML.save(yaml_path, data)
-                data = check_det_dataset(yaml_path, autodownload)  # dict
-                data["path"] = data_dir  # YAML path should be set to '' (relative) or parent (absolute)
-            except Exception as e:
-                raise Exception("error/HUB/dataset_stats/init") from e
-
-        self.hub_dir = Path(f"{data['path']}-hub")
-        self.im_dir = self.hub_dir / "images"
-        self.stats = {"nc": len(data["names"]), "names": list(data["names"].values())}  # statistics dictionary
-        self.data = data
-
-    @staticmethod
-    def _unzip(path: Path) -> tuple[bool, str, Path]:
-        """Unzip data.zip."""
-        if not str(path).endswith(".zip"):  # path is data.yaml
-            return False, None, path
-        unzip_dir = unzip_file(path, path=path.parent)
-        assert unzip_dir.is_dir(), (
-            f"Error unzipping {path}, {unzip_dir} not found. path/to/abc.zip MUST unzip to path/to/abc/"
-        )
-        return True, str(unzip_dir), find_dataset_yaml(unzip_dir)  # zipped, data_dir, yaml_path
-
-    def _hub_ops(self, f: str):
-        """Save a compressed image for HUB previews."""
-        compress_one_image(f, self.im_dir / Path(f).name)  # save to dataset-hub
-
-    def get_json(self, save: bool = False, verbose: bool = False) -> dict:
-        """Return dataset JSON for Ultralytics HUB."""
-
-        def _round(labels):
-            """Update labels to integer class and 4 decimal place floats."""
-            if self.task == "detect":
-                coordinates = labels["bboxes"]
-            elif self.task in {"segment", "obb"}:  # Segment and OBB use segments. OBB segments are normalized xyxyxyxy
-                coordinates = [x.flatten() for x in labels["segments"]]
-            elif self.task == "pose":
-                n, nk, nd = labels["keypoints"].shape
-                coordinates = np.concatenate((labels["bboxes"], labels["keypoints"].reshape(n, nk * nd)), 1)
-            else:
-                raise ValueError(f"Undefined dataset task={self.task}.")
-            zipped = zip(labels["cls"], coordinates)
-            return [[int(c[0]), *(round(float(x), 4) for x in points)] for c, points in zipped]
-
-        for split in "train", "val", "test":
-            self.stats[split] = None  # predefine
-            path = self.data.get(split)
-
-            # Check split
-            if path is None:  # no split
-                continue
-            files = [f for f in Path(path).rglob("*.*") if f.suffix[1:].lower() in IMG_FORMATS]  # image files in split
-            if not files:  # no images
-                continue
-
-            # Get dataset statistics
-            if self.task == "classify":
-                from torchvision.datasets import ImageFolder  # scope for faster 'import ultralytics'
-
-                dataset = ImageFolder(self.data[split])
-
-                x = np.zeros(len(dataset.classes)).astype(int)
-                for im in dataset.imgs:
-                    x[im[1]] += 1
-
-                self.stats[split] = {
-                    "instance_stats": {"total": len(dataset), "per_class": x.tolist()},
-                    "image_stats": {"total": len(dataset), "unlabelled": 0, "per_class": x.tolist()},
-                    "labels": [{Path(k).name: v} for k, v in dataset.imgs],
-                }
-            else:
-                from ultralytics.data import YOLODataset
-
-                dataset = YOLODataset(img_path=self.data[split], data=self.data, task=self.task)
-                x = np.array(
-                    [
-                        np.bincount(label["cls"].astype(int).flatten(), minlength=self.data["nc"])
-                        for label in TQDM(dataset.labels, total=len(dataset), desc="Statistics")
-                    ]
-                )  # shape(128x80)
-                self.stats[split] = {
-                    "instance_stats": {"total": int(x.sum()), "per_class": x.sum(0).tolist()},
-                    "image_stats": {
-                        "total": len(dataset),
-                        "unlabelled": int(np.all(x == 0, 1).sum()),
-                        "per_class": (x > 0).sum(0).tolist(),
-                    },
-                    "labels": [{Path(k).name: _round(v)} for k, v in zip(dataset.im_files, dataset.labels)],
-                }
-
-        # Save, print and return
-        if save:
-            self.hub_dir.mkdir(parents=True, exist_ok=True)  # makes dataset-hub/
-            stats_path = self.hub_dir / "stats.json"
-            LOGGER.info(f"Saving {stats_path.resolve()}...")
-            with open(stats_path, "w", encoding="utf-8") as f:
-                json.dump(self.stats, f)  # save stats.json
-        if verbose:
-            LOGGER.info(json.dumps(self.stats, indent=2, sort_keys=False))
-        return self.stats
-
-    def process_images(self) -> Path:
-        """Compress images for Ultralytics HUB."""
-        from ultralytics.data import YOLODataset  # ClassificationDataset
-
-        self.im_dir.mkdir(parents=True, exist_ok=True)  # makes dataset-hub/images/
-        for split in "train", "val", "test":
-            if self.data.get(split) is None:
-                continue
-            dataset = YOLODataset(img_path=self.data[split], data=self.data)
-            with ThreadPool(NUM_THREADS) as pool:
-                for _ in TQDM(pool.imap(self._hub_ops, dataset.im_files), total=len(dataset), desc=f"{split} images"):
-                    pass
-        LOGGER.info(f"Done. All images saved to {self.im_dir}")
-        return self.im_dir
 
 
 def compress_one_image(f: str, f_new: str | None = None, max_dim: int = 1920, quality: int = 50):
@@ -781,7 +797,7 @@ def compress_one_image(f: str, f_new: str | None = None, max_dim: int = 1920, qu
             im = im.resize((int(im.width * r), int(im.height * r)))
         im.save(f_new or f, "JPEG", quality=quality, optimize=True)  # save
     except Exception as e:  # use OpenCV
-        LOGGER.warning(f"HUB ops PIL failure {f}: {e}")
+        LOGGER.warning(f"Image compression PIL failure {f}: {e}")
         im = cv2.imread(f)
         im_height, im_width = im.shape[:2]
         r = max_dim / max(im_height, im_width)  # ratio
@@ -806,8 +822,35 @@ def save_dataset_cache_file(prefix: str, path: Path, x: dict, version: str):
     if is_dir_writeable(path.parent):
         if path.exists():
             path.unlink()  # remove *.cache file if exists
-        with open(str(path), "wb") as file:  # context manager here fixes windows async np.save bug
-            np.save(file, x)
-        LOGGER.info(f"{prefix}New cache created: {path}")
+        try:
+            with open(str(path), "wb") as file:  # context manager here fixes windows async np.save bug
+                np.save(file, x)
+            LOGGER.info(f"{prefix}New cache created: {path}")
+        except Exception as e:
+            Path(path).unlink(missing_ok=True)  # remove partially written file
+            LOGGER.warning(f"{prefix}WARNING ⚠️ Failed to save cache to {path}: {e}")
     else:
         LOGGER.warning(f"{prefix}Cache directory {path.parent} is not writable, cache not saved.")
+
+
+def add_polygon_background(data: dict) -> dict:
+    """Set up the background class for polygon-based semantic datasets without 'masks_dir'.
+
+    - nc > 1: appends a 'background' class at id=nc and bumps data['nc'] to nc+1; polygon
+    cls values are kept as foreground ids.
+    - nc == 1: keeps nc=1 (binary segmentation). Polygon rasterization
+    yields a {0=bg, 1=fg} mask regardless of the label cls value.
+    """
+    if data.get("masks_dir") or data.get("_polygon_bg_added"):
+        return data
+    nc = int(data.get("nc") or len(data.get("names") or {}))
+    if nc == 1:  # binary: bg=0, fg=1 (implicit); model uses BCE on a single output channel
+        data["bg_class_idx"] = 0
+    else:
+        names = dict(data.get("names") or {})
+        names[nc] = "background"
+        data["bg_class_idx"] = nc
+        data["nc"] = nc + 1
+        data["names"] = names
+    data["_polygon_bg_added"] = True
+    return data

@@ -93,15 +93,15 @@ class TransformerEncoderLayer(nn.Module):
         In post-norm architecture, normalization is applied after attention and feedforward operations.
 
         Args:
-            tgt: Input tensor to be processed
-            memory: Memory tensor for cross-attention
-            tgt_mask: Mask for self-attention
-            memory_mask: Mask for cross-attention
-            tgt_key_padding_mask: Key padding mask for self-attention
-            memory_key_padding_mask: Key padding mask for cross-attention
-            pos: Positional encoding for memory
-            query_pos: Positional encoding for query
-            **kwargs: Additional keyword arguments
+            tgt (torch.Tensor): Input tensor to be processed.
+            memory (torch.Tensor): Memory tensor for cross-attention.
+            tgt_mask (torch.Tensor): Mask for self-attention.
+            memory_mask (torch.Tensor): Mask for cross-attention.
+            tgt_key_padding_mask (torch.Tensor): Key padding mask for self-attention.
+            memory_key_padding_mask (torch.Tensor): Key padding mask for cross-attention.
+            pos (torch.Tensor): Positional encoding for memory.
+            query_pos (torch.Tensor): Positional encoding for query.
+            **kwargs (Any): Additional keyword arguments.
 
         Returns:
             Processed tensor
@@ -278,8 +278,8 @@ class TransformerEncoder(nn.Module):
         # assign layer index to each layer so that some layers can decide what to do
         # based on which layer index they are (e.g. cross attention to memory bank only
         # in selected layers)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.layer_idx = layer_idx
+        for layer_idx, encoder_layer in enumerate(self.layers):
+            encoder_layer.layer_idx = layer_idx
 
     def _prepare_multilevel_features(self, srcs, masks, pos_embeds):
         """Prepare multi-level features for transformer encoder."""
@@ -288,13 +288,8 @@ class TransformerEncoder(nn.Module):
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
-        spatial_shapes = []
         has_mask = masks is not None and masks[0] is not None
         for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
-            _, _, h, w = src.shape
-            spatial_shape = (h, w)
-            spatial_shapes.append(spatial_shape)
-
             src = src.flatten(2).transpose(1, 2)  # bs, hw, c
             if has_mask:
                 mask = mask.flatten(1)
@@ -310,13 +305,6 @@ class TransformerEncoder(nn.Module):
         src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
         mask_flatten = torch.cat(mask_flatten, 1) if has_mask else None  # bs, \sum{hxw}
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
-        spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
-        level_start_index = torch.cat(
-            (
-                spatial_shapes.new_zeros((1,)),
-                spatial_shapes.prod(1).cumsum(0)[:-1],
-            )
-        )
         if has_mask:
             valid_ratios = torch.stack([get_valid_ratio(m) for m in masks], 1)
         else:
@@ -330,9 +318,7 @@ class TransformerEncoder(nn.Module):
             src_flatten,
             mask_flatten,
             lvl_pos_embed_flatten,
-            level_start_index,
             valid_ratios,
-            spatial_shapes,
         )
 
     def forward(
@@ -343,7 +329,7 @@ class TransformerEncoder(nn.Module):
         prompt: torch.Tensor = None,
         prompt_key_padding_mask: torch.Tensor = None,
         encoder_extra_kwargs: dict | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process multi-level features through the transformer encoder.
 
         Args:
@@ -361,8 +347,6 @@ class TransformerEncoder(nn.Module):
             - output: Processed features with shape (seq_len, batch_size, d_model)
             - key_padding_masks_flatten: Flattened padding masks
             - lvl_pos_embed_flatten: Flattened positional embeddings
-            - level_start_index: Starting indices for each feature level
-            - spatial_shapes: Spatial dimensions of each feature level
             - valid_ratios: Valid ratios for each feature level
         """
         assert len(src) == self.num_feature_levels, "must be equal to num_feature_levels"
@@ -375,9 +359,7 @@ class TransformerEncoder(nn.Module):
             src_flatten,
             key_padding_masks_flatten,
             lvl_pos_embed_flatten,
-            level_start_index,
             valid_ratios,
-            spatial_shapes,
         ) = self._prepare_multilevel_features(src, src_key_padding_masks, pos)
 
         output = src_flatten
@@ -401,8 +383,6 @@ class TransformerEncoder(nn.Module):
             output.transpose(0, 1),
             (key_padding_masks_flatten.transpose(0, 1) if key_padding_masks_flatten is not None else None),
             lvl_pos_embed_flatten.transpose(0, 1),
-            level_start_index,
-            spatial_shapes,
             valid_ratios,
         )
 
@@ -414,14 +394,14 @@ class TransformerEncoderFusion(TransformerEncoder):
     features to image features for better cross-modal fusion. It supports torch.compile for performance optimization.
 
     Args:
-        layer: The encoder layer to be stacked multiple times
-        num_layers: Number of encoder layers to stack
-        d_model: Model dimension/hidden size
-        num_feature_levels: Number of feature levels to process
-        add_pooled_text_to_img_feat: Whether to add pooled text features to image features
-        pool_text_with_mask: Whether to use the mask when pooling text features
-        compile_mode: Mode for torch.compile, or None to disable compilation
-        **kwargs: Additional arguments to pass to the parent class
+        layer (nn.Module): The encoder layer to be stacked multiple times.
+        num_layers (int): Number of encoder layers to stack.
+        d_model (int): Model dimension/hidden size.
+        num_feature_levels (int): Number of feature levels to process.
+        add_pooled_text_to_img_feat (bool): Whether to add pooled text features to image features.
+        pool_text_with_mask (bool): Whether to use the mask when pooling text features.
+        compile_mode (str | None): Mode for torch.compile, or None to disable compilation.
+        **kwargs (Any): Additional arguments to pass to the parent class.
     """
 
     def __init__(
@@ -476,7 +456,7 @@ class TransformerEncoderFusion(TransformerEncoder):
                     else None
                 )
         else:
-            assert all(x.dim == 4 for x in src), "expected list of (bs, c, h, w) tensors"
+            assert all(x.dim() == 4 for x in src), "expected list of (bs, c, h, w) tensors"
 
         if self.add_pooled_text_to_img_feat:
             # Fusion: Add mean pooled text to image features
@@ -488,8 +468,6 @@ class TransformerEncoderFusion(TransformerEncoder):
             out,
             key_padding_masks_flatten,
             lvl_pos_embed_flatten,
-            level_start_index,
-            spatial_shapes,
             valid_ratios,
         ) = super().forward(
             src,
@@ -505,8 +483,6 @@ class TransformerEncoderFusion(TransformerEncoder):
             "padding_mask": key_padding_masks_flatten,
             "pos_embed": lvl_pos_embed_flatten,
             "memory_text": prompt,
-            "level_start_index": level_start_index,
-            "spatial_shapes": spatial_shapes,
             "valid_ratios": valid_ratios,
         }
 

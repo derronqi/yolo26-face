@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import copy
 
+from ultralytics.data.utils import get_split_fraction
 from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.nn.tasks import RTDETRDetectionModel
 from ultralytics.utils import RANK, colorstr
@@ -19,7 +20,7 @@ class RTDETRTrainer(DetectionTrainer):
     inference speed.
 
     Attributes:
-        loss_names (tuple): Names of the loss components used for training.
+        loss_names (tuple): Names of the loss components, derived from the loss dict returned by the criterion.
         data (dict): Dataset configuration containing class count and other parameters.
         args (dict): Training arguments and hyperparameters.
         save_dir (Path): Directory to save training results.
@@ -52,7 +53,9 @@ class RTDETRTrainer(DetectionTrainer):
         Returns:
             (RTDETRDetectionModel): Initialized model.
         """
-        model = RTDETRDetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = self.set_model_names_for_load(
+            RTDETRDetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        )
         if weights:
             model.load(weights)
         return model
@@ -80,10 +83,9 @@ class RTDETRTrainer(DetectionTrainer):
             prefix=colorstr(f"{mode}: "),
             classes=self.args.classes,
             data=self.data,
-            fraction=self.args.fraction if mode == "train" else 1.0,
+            fraction=1.0 if self.data.get("complete") else get_split_fraction(self.args.fraction, mode),
         )
 
     def get_validator(self):
         """Return an RTDETRValidator suitable for RT-DETR model validation."""
-        self.loss_names = "giou_loss", "cls_loss", "l1_loss"
         return RTDETRValidator(self.test_loader, save_dir=self.save_dir, args=copy(self.args))

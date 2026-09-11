@@ -8,73 +8,61 @@ from copy import deepcopy
 
 
 def on_pretrain_routine_start(trainer):
-    """Called before the pretraining routine starts."""
-    pass
+    """Called at the beginning of the pre-training routine, before data loading and model setup."""
 
 
 def on_pretrain_routine_end(trainer):
-    """Called after the pretraining routine ends."""
-    pass
+    """Called at the end of the pre-training routine, after data loading and model setup are complete."""
 
 
 def on_train_start(trainer):
-    """Called when the training starts."""
-    pass
+    """Called when the training starts, before the first epoch begins."""
 
 
 def on_train_epoch_start(trainer):
-    """Called at the start of each training epoch."""
-    pass
+    """Called at the start of each training epoch, before batch iteration begins."""
 
 
 def on_train_batch_start(trainer):
-    """Called at the start of each training batch."""
-    pass
+    """Called at the start of each training batch, before the forward pass."""
 
 
 def optimizer_step(trainer):
-    """Called when the optimizer takes a step."""
-    pass
+    """Called during the optimizer step. Reserved for custom integrations; not called by default."""
 
 
 def on_before_zero_grad(trainer):
-    """Called before the gradients are set to zero."""
-    pass
+    """Called before the gradients are set to zero. Reserved for custom integrations; not called by default."""
 
 
 def on_train_batch_end(trainer):
-    """Called at the end of each training batch."""
-    pass
+    """Called at the end of each training batch, after the backward pass. Optimizer step may be deferred by
+    accumulation.
+    """
 
 
 def on_train_epoch_end(trainer):
-    """Called at the end of each training epoch."""
-    pass
+    """Called at the end of each training epoch, after all batches but before validation."""
 
 
 def on_fit_epoch_end(trainer):
-    """Called at the end of each fit epoch (train + val)."""
-    pass
+    """Called at the end of each fit epoch (train + val), after validation and any checkpoint save."""
 
 
 def on_model_save(trainer):
-    """Called when the model is saved."""
-    pass
+    """Called when the model checkpoint is saved, after validation."""
 
 
 def on_train_end(trainer):
-    """Called when the training ends."""
-    pass
+    """Called when the training ends, after final evaluation of the best model."""
 
 
 def on_params_update(trainer):
-    """Called when the model parameters are updated."""
-    pass
+    """Called when the model parameters are updated. Reserved for custom integrations; not called by default."""
 
 
 def teardown(trainer):
     """Called during the teardown of the training process."""
-    pass
 
 
 # Validator callbacks --------------------------------------------------------------------------------------------------
@@ -82,22 +70,18 @@ def teardown(trainer):
 
 def on_val_start(validator):
     """Called when the validation starts."""
-    pass
 
 
 def on_val_batch_start(validator):
     """Called at the start of each validation batch."""
-    pass
 
 
 def on_val_batch_end(validator):
     """Called at the end of each validation batch."""
-    pass
 
 
 def on_val_end(validator):
     """Called when the validation ends."""
-    pass
 
 
 # Predictor callbacks --------------------------------------------------------------------------------------------------
@@ -105,27 +89,22 @@ def on_val_end(validator):
 
 def on_predict_start(predictor):
     """Called when the prediction starts."""
-    pass
 
 
 def on_predict_batch_start(predictor):
     """Called at the start of each prediction batch."""
-    pass
 
 
 def on_predict_batch_end(predictor):
     """Called at the end of each prediction batch."""
-    pass
 
 
 def on_predict_postprocess_end(predictor):
     """Called after the post-processing of the prediction ends."""
-    pass
 
 
 def on_predict_end(predictor):
     """Called when the prediction ends."""
-    pass
 
 
 # Exporter callbacks ---------------------------------------------------------------------------------------------------
@@ -133,12 +112,10 @@ def on_predict_end(predictor):
 
 def on_export_start(exporter):
     """Called when the model export starts."""
-    pass
 
 
 def on_export_end(exporter):
     """Called when the model export ends."""
-    pass
 
 
 default_callbacks = {
@@ -193,10 +170,8 @@ def get_default_callbacks():
 def add_integration_callbacks(instance):
     """Add integration callbacks to the instance's callbacks dictionary.
 
-    This function loads and adds various integration callbacks to the provided instance. The specific callbacks added
-    depend on the type of instance provided. All instances receive HUB callbacks, while Trainer instances also receive
-    additional callbacks for various integrations like ClearML, Comet, DVC, MLflow, Neptune, Ray Tune, TensorBoard, and
-    Weights & Biases.
+    This function loads and adds analytics callbacks to every instance. Trainer instances also receive Platform and
+    experiment logger callbacks for ClearML, Comet, DVC, MLflow, Ray Tune, TensorBoard, and Weights & Biases.
 
     Args:
         instance (Trainer | Predictor | Validator | Exporter): The object instance to which callbacks will be added. The
@@ -207,11 +182,9 @@ def add_integration_callbacks(instance):
         >>> trainer = BaseTrainer()
         >>> add_integration_callbacks(trainer)
     """
-    from .hub import callbacks as hub_cb
-    from .platform import callbacks as platform_cb
+    from ultralytics.utils.events import callbacks as events_cb
 
-    # Load Ultralytics callbacks
-    callbacks_list = [hub_cb, platform_cb]
+    callbacks_list = [events_cb]
 
     # Load training callbacks
     if "Trainer" in instance.__class__.__name__:
@@ -219,12 +192,12 @@ def add_integration_callbacks(instance):
         from .comet import callbacks as comet_cb
         from .dvc import callbacks as dvc_cb
         from .mlflow import callbacks as mlflow_cb
-        from .neptune import callbacks as neptune_cb
+        from .platform import callbacks as platform_cb
         from .raytune import callbacks as tune_cb
         from .tensorboard import callbacks as tb_cb
         from .wb import callbacks as wb_cb
 
-        callbacks_list.extend([clear_cb, comet_cb, dvc_cb, mlflow_cb, neptune_cb, tune_cb, tb_cb, wb_cb])
+        callbacks_list.extend([platform_cb, clear_cb, comet_cb, dvc_cb, mlflow_cb, tune_cb, tb_cb, wb_cb])
 
     # Add the callbacks to the callbacks dictionary
     for callbacks in callbacks_list:
